@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import shutil
+
+# Configuration
+DEFAULT_IMAGE = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2"
+SKELETON_DIR = os.path.expanduser("~/.gemvm/skeleton")
+
+def run_cmd(cmd, check=True, capture_output=False):
+    """Utility to run shell commands."""
+    try:
+        return subprocess.run(cmd, shell=True, check=check, capture_output=capture_output, text=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running command: {cmd}")
+        if e.stderr:
+            print(e.stderr)
+        sys.exit(1)
+
+def get_lima_config_yaml(project_name):
+    """Generates the Lima configuration YAML as a string."""
+    return f"""
+vmType: "vz"
+arch: "aarch64"
+images:
+- location: "{DEFAULT_IMAGE}"
+  arch: "aarch64"
+cpus: 4
+memory: "4GiB"
+containerd:
+  system: false
+  user: false
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -e
+    apt-get update
+    apt-get install -y sudo ca-certificates git build-essential curl tmux screen python3 python3-pip nodejs npm
+    # Ensure default user has passwordless sudo
+    echo "$(whoami) ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/99-gemvm
+- mode: user
+  script: |
+    #!/bin/bash
+    set -e
+    # Install Gemini CLI globally
+    sudo npm install -g @google/gemini-cli
+    # Setup initial Gemini config directory
+    mkdir -p ~/.gemini
+    # Trust all folders for Gemini CLI to enable "yolo" flow without prompts
+    echo '{{"/": "TRUST_FOLDER"}}' > ~/.gemini/trustedFolders.json
+"""
+
+def create_vm(args):
+    project_name = args.project
+    print(f"[*] Creating VM for project: {project_name}...")
+
+    yaml_content = get_lima_config_yaml(project_name)
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        f.write(yaml_content)
+        temp_config_path = f.name
+
+    try:
+        # Start the VM
+        print("[*] Starting VM via limactl (this may take a few minutes)...")
+        # Use --tty=false to avoid interactive prompts during start
+        run_cmd(f"limactl start --name={project_name} {temp_config_path} --tty=false")
+        
+        # Sync credentials
+        sync_creds(project_name)
+        
+        # Sync skeleton
+        sync_skeleton(project_name, args.skeleton)
+        
+        print(f"[*] VM {project_name} is ready.")
+        
+        # Start interactive session
+        start_session(project_name)
+
+    finally:
+        if os.path.exists(temp_config_path):
+            os.remove(temp_config_path)
+
+def sync_creds(project_name):
+    print("[*] Synchronizing Gemini credentials...")
+    host_gemini_dir = os.path.expanduser("~/.gemini")
+    files_to_copy = ["oauth_creds.json", "google_accounts.json", "settings.json", "installation_id"]
+    
+    run_cmd(f"limactl shell {project_name} mkdir -p ~/.gemini")
+    
+    for f in files_to_copy:
+        src = os.path.join(host_gemini_dir, f)
+        if os.path.exists(src):
+            run_cmd(f"limactl copy {src} {project_name}:.gemini/{f}")
+
+def sync_skeleton(project_name, skeleton_path):
+    path = skeleton_path or SKELETON_DIR
+    if os.path.exists(path):
+        print(f"[*] Copying skeleton from {path}...")
+        # Use tar for efficient recursive copy via lima
+        run_cmd(f"tar -C {path} -cf - . | limactl shell {project_name} tar -C ~ -xf -")
+    else:
+        if skeleton_path:
+            print(f"[!] Warning: Skeleton path {path} does not exist.")
+
+def start_session(project_name):
+    print(f"[*] Attaching to VM {project_name}...")
+    # Exec into the VM and start a tmux session with gemini CLI
+    os.execvp("limactl", ["limactl", "shell", project_name, "tmux", "new-session", "-A", "-s", "gemini", "gemini --yolo"])
+
+def ssh_vm(args):
+    print(f"[*] Connecting to VM {args.project}...")
+    ssh_config = os.path.expanduser(f"~/.lima/{args.project}/ssh.config")
+    if not os.path.exists(ssh_config):
+        print(f"[!] Error: SSH configuration for {args.project} not found. Is the VM created?")
+        sys.exit(1)
+    
+    # Use direct ssh with the lima config
+    cmd = ["ssh", "-F", ssh_config, f"lima-{args.project}"] + args.ssh_args
+    os.execvp("ssh", cmd)
+
+def stop_vm(args):
+    print(f"[*] Stopping VM {args.project}...")
+    run_cmd(f"limactl stop {args.project}")
+
+def delete_vm(args):
+    print(f"[*] Deleting VM {args.project}...")
+    run_cmd(f"limactl delete {args.project} --force")
+
+def list_vms(args):
+    run_cmd("limactl list")
+
+def main():
+    parser = argparse.ArgumentParser(description="gemvm: Manage isolated Gemini CLI development VMs")
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Create
+    create_parser = subparsers.add_parser("create", help="Create a new project VM")
+    create_parser.add_argument("project", help="Project name")
+    create_parser.add_argument("--skeleton", help="Path to skeleton directory")
+    create_parser.set_defaults(func=create_vm)
+
+    # SSH
+    ssh_parser = subparsers.add_parser("ssh", help="SSH into the project VM")
+    ssh_parser.add_argument("project", help="Project name")
+    ssh_parser.add_argument("ssh_args", nargs=argparse.REMAINDER, help="Additional SSH arguments")
+    ssh_parser.set_defaults(func=ssh_vm)
+
+    # Stop
+    stop_parser = subparsers.add_parser("stop", help="Stop the project VM")
+    stop_parser.add_argument("project", help="Project name")
+    stop_parser.set_defaults(func=stop_vm)
+
+    # Delete
+    delete_parser = subparsers.add_parser("delete", help="Delete the project VM")
+    delete_parser.add_argument("project", help="Project name")
+    delete_parser.set_defaults(func=delete_vm)
+
+    # List
+    list_parser = subparsers.add_parser("list", help="List all VMs")
+    list_parser.set_defaults(func=list_vms)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
