@@ -22,6 +22,18 @@ def run_cmd(cmd, check=True, capture_output=False):
             print(e.stderr)
         sys.exit(1)
 
+def push_title():
+    sys.stdout.write('\033[22;0t')
+    sys.stdout.flush()
+
+def pop_title():
+    sys.stdout.write('\033[23;0t')
+    sys.stdout.flush()
+
+def set_title(title):
+    sys.stdout.write(f'\033]0;{title}\007')
+    sys.stdout.flush()
+
 def get_lima_config_yaml(project_name):
     """Generates the Lima configuration YAML as a string."""
     # Use a template and replace to avoid f-string escape sequence issues
@@ -33,6 +45,8 @@ images:
   arch: "aarch64"
 cpus: 4
 memory: "4GiB"
+networks:
+- vzNAT: true
 containerd:
   system: false
   user: false
@@ -53,6 +67,12 @@ provision:
     # Ensure global npm bin directory is in PATH for all users
     NPM_CONFIG_PREFIX=$(npm config get prefix)
     echo "export PATH=\\$PATH:$NPM_CONFIG_PREFIX/bin" > /etc/profile.d/gemvm-path.sh
+    
+    # Fix SSH delay with vzNAT by resolving UNKNOWN hostname and disabling UseDNS
+    echo "127.0.0.1 UNKNOWN" >> /etc/hosts
+    sed -i 's/^#UseDNS yes/UseDNS no/' /etc/ssh/sshd_config
+    echo "UseDNS no" >> /etc/ssh/sshd_config
+    systemctl restart ssh
 - mode: user
   script: |
     #!/bin/bash
@@ -74,7 +94,18 @@ provision:
     [ -f /etc/bash_completion ] && . /etc/bash_completion
     EOF
     fi
+
+    # Create a basic .tmux.conf to disable alternate screen and preserve native scrollback
+    if [ ! -f ~/.tmux.conf ]; then
+      cat << 'EOF' > ~/.tmux.conf
+    # Disable alternate screen to allow native terminal scrollback (e.g. iTerm2)
+    # This preserves output in your terminal window even after you detach from tmux
+    set -ga terminal-overrides ',xterm*:smcup@:rmcup@'
+    EOF
+    fi
 """
+
+
     return template.replace("{DEFAULT_IMAGE}", DEFAULT_IMAGE)
 
 def create_vm(args):
@@ -150,8 +181,27 @@ def sync_skeleton(project_name, skeleton_path):
 
 def start_session(project_name):
     print(f"[*] Attaching to VM {project_name}...")
-    # Exec into the VM and start a tmux session with gemini CLI
-    os.execvp("limactl", ["limactl", "shell", project_name, "tmux", "new-session", "-A", "-s", "gemini", "gemini --yolo"])
+    
+    push_title()
+    set_title(f"gemvm: {project_name}")
+    
+    # Smart attach: check if session exists and if gemini is running.
+    # If not, restart it before attaching.
+    tmux_script = """
+    if tmux has-session -t "gemini" 2>/dev/null; then
+        if ! tmux list-panes -t "gemini" -F "#{pane_current_command}" | grep -qE "^node$|^gemini$"; then
+            tmux send-keys -t "gemini" "gemini --yolo" Enter
+        fi
+        exec tmux attach-session -t "gemini"
+    else
+        exec tmux new-session -s "gemini" "gemini --yolo"
+    fi
+    """
+    
+    try:
+        subprocess.run(["limactl", "shell", project_name, "bash", "-l", "-c", tmux_script])
+    finally:
+        pop_title()
 
 def ssh_vm(args):
     print(f"[*] Connecting to VM {args.project}...")
@@ -165,7 +215,13 @@ def ssh_vm(args):
     # Multiplexed connections created in the background don't forward the agent,
     # so reusing them breaks the -A flag.
     cmd = ["ssh", "-F", ssh_config, "-o", "ControlPath=none", f"lima-{args.project}"] + args.ssh_args
-    os.execvp("ssh", cmd)
+    
+    push_title()
+    set_title(f"gemvm: {args.project}")
+    try:
+        subprocess.run(cmd)
+    finally:
+        pop_title()
 
 def stop_vm(args):
     print(f"[*] Stopping VM {args.project}...")
@@ -218,6 +274,10 @@ def main():
     # List
     list_parser = subparsers.add_parser("list", help="List all VMs")
     list_parser.set_defaults(func=list_vms)
+
+    # Help
+    help_parser = subparsers.add_parser("help", help="Show this help message")
+    help_parser.set_defaults(func=lambda args: parser.print_help())
 
     args = parser.parse_args()
 
