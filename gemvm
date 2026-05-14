@@ -24,7 +24,8 @@ def run_cmd(cmd, check=True, capture_output=False):
 
 def get_lima_config_yaml(project_name):
     """Generates the Lima configuration YAML as a string."""
-    return f"""
+    # Use a template and replace to avoid f-string escape sequence issues
+    template = """
 vmType: "vz"
 arch: "aarch64"
 images:
@@ -41,9 +42,17 @@ provision:
     #!/bin/bash
     set -e
     apt-get update
-    apt-get install -y sudo ca-certificates git build-essential curl tmux screen python3 python3-pip nodejs npm
+    apt-get install -y sudo ca-certificates git build-essential curl tmux screen python3 python3-pip
+    
+    # Install Node.js v20 from NodeSource (Gemini CLI requires Node v20+)
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
+    
     # Ensure default user has passwordless sudo
     echo "$(whoami) ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/99-gemvm
+    # Ensure global npm bin directory is in PATH for all users
+    NPM_CONFIG_PREFIX=$(npm config get prefix)
+    echo "export PATH=\\$PATH:$NPM_CONFIG_PREFIX/bin" > /etc/profile.d/gemvm-path.sh
 - mode: user
   script: |
     #!/bin/bash
@@ -53,61 +62,91 @@ provision:
     # Setup initial Gemini config directory
     mkdir -p ~/.gemini
     # Trust all folders for Gemini CLI to enable "yolo" flow without prompts
-    echo '{{"/": "TRUST_FOLDER"}}' > ~/.gemini/trustedFolders.json
+    echo '{"/": "TRUST_FOLDER"}' > ~/.gemini/trustedFolders.json
+    
+    # Create a basic .bashrc if it doesn't exist
+    if [ ! -f ~/.bashrc ]; then
+      cat << 'EOF' > ~/.bashrc
+    # Basic .bashrc for gemvm
+    export PS1='\\[\\e[1;32m\\]gemvm\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\$ '
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+    [ -f /etc/bash_completion ] && . /etc/bash_completion
+    EOF
+    fi
 """
+    return template.replace("{DEFAULT_IMAGE}", DEFAULT_IMAGE)
 
 def create_vm(args):
     project_name = args.project
-    print(f"[*] Creating VM for project: {project_name}...")
+    print(f"[*] Ensuring VM {project_name} is ready...")
 
-    yaml_content = get_lima_config_yaml(project_name)
+    # Check if VM already exists
+    check_exists = subprocess.run(f"limactl list {project_name}", shell=True, capture_output=True, text=True)
+    exists = project_name in check_exists.stdout
+
+    if not exists:
+        print(f"[*] Creating new VM for project: {project_name}...")
+        yaml_content = get_lima_config_yaml(project_name)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(yaml_content)
+            temp_config_path = f.name
+
+        try:
+            # Start/Create the VM
+            print("[*] Starting VM via limactl (this may take a few minutes)...")
+            run_cmd(f"limactl start --name={project_name} {temp_config_path} --tty=false")
+        finally:
+            if os.path.exists(temp_config_path):
+                os.remove(temp_config_path)
+    else:
+        # VM exists, just make sure it's running
+        print(f"[*] VM {project_name} already exists. Ensuring it is started...")
+        run_cmd(f"limactl start {project_name} --tty=false")
+
+    # Sync credentials
+    sync_creds(project_name)
     
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-        f.write(yaml_content)
-        temp_config_path = f.name
-
-    try:
-        # Start the VM
-        print("[*] Starting VM via limactl (this may take a few minutes)...")
-        # Use --tty=false to avoid interactive prompts during start
-        run_cmd(f"limactl start --name={project_name} {temp_config_path} --tty=false")
-        
-        # Sync credentials
-        sync_creds(project_name)
-        
-        # Sync skeleton
-        sync_skeleton(project_name, args.skeleton)
-        
-        print(f"[*] VM {project_name} is ready.")
-        
-        # Start interactive session
-        start_session(project_name)
-
-    finally:
-        if os.path.exists(temp_config_path):
-            os.remove(temp_config_path)
+    # Sync skeleton
+    sync_skeleton(project_name, args.skeleton)
+    
+    print(f"[*] VM {project_name} is ready.")
+    
+    # Start interactive session
+    start_session(project_name)
 
 def sync_creds(project_name):
     print("[*] Synchronizing Gemini credentials...")
     host_gemini_dir = os.path.expanduser("~/.gemini")
+    # Using .gemini (relative to home) to avoid host-side ~ expansion issues
     files_to_copy = ["oauth_creds.json", "google_accounts.json", "settings.json", "installation_id"]
     
-    run_cmd(f"limactl shell {project_name} mkdir -p ~/.gemini")
+    run_cmd(f"limactl shell {project_name} mkdir -p .gemini")
     
     for f in files_to_copy:
         src = os.path.join(host_gemini_dir, f)
         if os.path.exists(src):
+            # Target path is relative to the guest's home directory
             run_cmd(f"limactl copy {src} {project_name}:.gemini/{f}")
 
 def sync_skeleton(project_name, skeleton_path):
     path = skeleton_path or SKELETON_DIR
-    if os.path.exists(path):
+    if os.path.exists(path) and os.listdir(path):
         print(f"[*] Copying skeleton from {path}...")
-        # Use tar for efficient recursive copy via lima
-        run_cmd(f"tar -C {path} -cf - . | limactl shell {project_name} tar -C ~ -xf -")
+        # Ensure all parts of the command use f-strings for project_name expansion
+        # Use bash -c in the guest so that ~ expands properly without quoting issues
+        tar_cmd = (
+            f"tar -C {path} --no-xattrs --no-mac-metadata "
+            f"--exclude='.DS_Store' --exclude='.localized' "
+            f"-cf - . | limactl shell {project_name} bash -c 'tar -C ~ -xf -'"
+        )
+        run_cmd(tar_cmd)
     else:
         if skeleton_path:
-            print(f"[!] Warning: Skeleton path {path} does not exist.")
+            print(f"[!] Warning: Skeleton path {path} does not exist or is empty.")
+        else:
+            # Silent skip for the default path if it doesn't exist
+            pass
 
 def start_session(project_name):
     print(f"[*] Attaching to VM {project_name}...")
@@ -121,8 +160,11 @@ def ssh_vm(args):
         print(f"[!] Error: SSH configuration for {args.project} not found. Is the VM created?")
         sys.exit(1)
     
-    # Use direct ssh with the lima config
-    cmd = ["ssh", "-F", ssh_config, f"lima-{args.project}"] + args.ssh_args
+    # Use direct ssh with the lima config.
+    # We pass -o ControlPath=none to bypass Lima's connection multiplexing.
+    # Multiplexed connections created in the background don't forward the agent,
+    # so reusing them breaks the -A flag.
+    cmd = ["ssh", "-F", ssh_config, "-o", "ControlPath=none", f"lima-{args.project}"] + args.ssh_args
     os.execvp("ssh", cmd)
 
 def stop_vm(args):
@@ -132,6 +174,12 @@ def stop_vm(args):
 def delete_vm(args):
     print(f"[*] Deleting VM {args.project}...")
     run_cmd(f"limactl delete {args.project} --force")
+
+def cp_vm(args):
+    print(f"[*] Copying files...")
+    # limactl copy works similar to scp. Example: limactl copy my-project:file.txt .
+    # We pass the arguments directly.
+    run_cmd(f"limactl copy {' '.join(args.cp_args)}")
 
 def list_vms(args):
     run_cmd("limactl list")
@@ -151,6 +199,11 @@ def main():
     ssh_parser.add_argument("project", help="Project name")
     ssh_parser.add_argument("ssh_args", nargs=argparse.REMAINDER, help="Additional SSH arguments")
     ssh_parser.set_defaults(func=ssh_vm)
+
+    # Copy
+    cp_parser = subparsers.add_parser("cp", help="Copy files to/from the VM")
+    cp_parser.add_argument("cp_args", nargs=argparse.REMAINDER, help="Arguments for copy (e.g., project:file.txt .)")
+    cp_parser.set_defaults(func=cp_vm)
 
     # Stop
     stop_parser = subparsers.add_parser("stop", help="Stop the project VM")
